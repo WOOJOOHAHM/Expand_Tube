@@ -1,0 +1,1 @@
+python train.py --model RN50 --dataset hmdb --batch_size 2 --epochs 3 --fast_dev_run True
