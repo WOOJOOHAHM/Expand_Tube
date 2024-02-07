@@ -4,9 +4,8 @@ from typing import Any, Callable, List, Union
 
 import torch
 from torch import Tensor, nn, optim
-from torch.nn import functional as F
 from torchmetrics.functional import accuracy, f1_score
-from torchvision.transforms import transforms as T
+from torchvision.transforms import transforms  as T
 from torchvision.transforms._transforms_video import ToTensorVideo
 from pytorchvideo.transforms import Normalize, Permute, RandAugment
 
@@ -14,6 +13,27 @@ import sys
 sys.path.append("/hahmwj/expand_tube/models")
 from Backbone_models import build_model
 from models.dataset import VideoDataset
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="torchvision.transforms.functional_tensor")
+from torch.optim.lr_scheduler import LambdaLR
+
+
+class InverseSqrtScheduler(LambdaLR):
+    """ Linear warmup and then follows an inverse square root decay schedule
+        Linearly increases learning rate schedule from 0 to 1 over `warmup_steps` training steps.
+        Afterward, learning rate follows an inverse square root decay schedule.
+    """
+
+    def __init__(self, optimizer, warmup_steps, last_epoch=-1):
+        def lr_lambda(step):
+            if step < warmup_steps:
+                return float(step) / float(max(1.0, warmup_steps))
+            
+            decay_factor = warmup_steps ** 0.5
+            return decay_factor * step ** -0.5
+
+        super(InverseSqrtScheduler, self).__init__(optimizer, lr_lambda, last_epoch=last_epoch)
+
 
 def load_data(dataset_name: str, 
             path: str, 
@@ -54,7 +74,7 @@ def load_data(dataset_name: str,
         dataframe = pd.read_csv(f'{path}/ucf_sample.csv')
         num_classes = 101
     elif dataset_name == 'ucf':
-        dataframe = pd.read_csv(f'{path}/ucf.csv')
+        dataframe = pd.read_csv(f'{path}/ucf101.csv')
         num_classes = 101
     elif dataset_name == 'k400_sample':
         dataframe = pd.read_csv(f'{path}/k400_sample.csv')
@@ -122,7 +142,10 @@ class expand_tube_lightening(pl.LightningModule):
             model_name,
             pre_trained_model_save_path,
             num_classes,
-            lr: float = 3e-4,
+            warmup_steps,
+            num_frames,
+            classifier: str,
+            lr: float = 3e-3,
             weight_decay: float = 0,
             max_epochs: int = None,
             **kwargs,
@@ -130,14 +153,12 @@ class expand_tube_lightening(pl.LightningModule):
         self.save_hyperparameters()
         
         super().__init__()
-        self.model_name = model_name
-        self.pre_trained_model_save_path = pre_trained_model_save_path
         self.num_classes = num_classes
         self.lr = lr
         self.weight_decay = weight_decay
         self.max_epochs = max_epochs
-
-        self.model = build_model(self.model_name, self.pre_trained_model_save_path)
+        self.warmup_steps = warmup_steps
+        self.model = build_model(model_name, pre_trained_model_save_path, self.num_classes, classifier, num_frames).train()
         self.loss_func = nn.CrossEntropyLoss()
 
     def forward(self, x):
@@ -146,9 +167,7 @@ class expand_tube_lightening(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y = batch
         y_hat = self(x)
-
         loss = self.loss_func(y_hat, y)
-
         y_pred = torch.softmax(y_hat, dim=-1)
 
         # Logging to TensorBoard by default
@@ -178,13 +197,17 @@ class expand_tube_lightening(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.AdamW(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
-        if self.max_epochs is not None:
-            lr_scheduler = optim.lr_scheduler.OneCycleLR(
-                optimizer=optimizer, max_lr=self.lr, total_steps=self.max_epochs
-            )
-            return [optimizer], [lr_scheduler]
-        else:
-            return optimizer
+        scheduler = InverseSqrtScheduler(optimizer, self.warmup_steps)
+        sch_config = {
+		"scheduler": scheduler,
+		"interval": "step",
+    	}
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": sch_config,
+        }
+
 
     def predict_step(self, batch: Any, batch_idx: int, dataloader_idx: int = 0) -> Any:
         x, y = batch

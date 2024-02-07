@@ -6,18 +6,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-
-_MODELS = {
-    "RN50": "https://openaipublic.azureedge.net/clip/models/afeb0e10f9e5a86da6080e35cf09123aca3b358a0c3e3b6c78a7b63bc04b6762/RN50.pt",
-    "RN101": "https://openaipublic.azureedge.net/clip/models/8fa8567bab74a42d41c5915025a8e4538c3bdbe8804a470a72f30b0d94fab599/RN101.pt",
-    "RN50x4": "https://openaipublic.azureedge.net/clip/models/7e526bd135e493cef0776de27d5f42653e6b4c8bf9e0f653bb11773263205fdd/RN50x4.pt",
-    "RN50x16": "https://openaipublic.azureedge.net/clip/models/52378b407f34354e150460fe41077663dd5b39c54cd0bfd2b27167a4a06ec9aa/RN50x16.pt",
-    "RN50x64": "https://openaipublic.azureedge.net/clip/models/be1cfb55d75a9666199fb2206c106743da0f6468c9d327f3e0d0a543a9919d9c/RN50x64.pt",
-    "ViT-B/32": "https://openaipublic.azureedge.net/clip/models/40d365715913c9da98579312b702a82c18be219cc2a73407c4526f58eba950af/ViT-B-32.pt",
-    "ViT-B/16": "https://openaipublic.azureedge.net/clip/models/5806e77cd80f8b59890b7e101eabd078d9fb84e6937f9e85e4ecb61988df416f/ViT-B-16.pt",
-    "ViT-L/14": "https://openaipublic.azureedge.net/clip/models/b8cca3fd41ae0c99ba7e8951adf17d267cdb84cd88be6f7c2e0eca1737a03836/ViT-L-14.pt",
-    "ViT-L/14@336px": "https://openaipublic.azureedge.net/clip/models/3035c92b350959924f9f00213499208652fc7ea050643e8b385c2dac08641f02/ViT-L-14-336px.pt",
-}
+from Positional_embeding import get_3d_sincos_pos_embed
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -78,9 +67,13 @@ class AttentionPool2d(nn.Module):
         self.num_heads = num_heads
 
     def forward(self, x):
+        print(x.size(), ' 0')
         x = x.flatten(start_dim=2).permute(2, 0, 1)  # NCHW -> (HW)NC
+        print(x.size(), ' 1')
         x = torch.cat([x.mean(dim=0, keepdim=True), x], dim=0)  # (HW+1)NC
+        print(x.size(), ' 2')
         x = x + self.positional_embedding[:, None, :].to(x.dtype)  # (HW+1)NC
+        print(x.size(), ' 3')
         x, _ = F.multi_head_attention_forward(
             query=x[:1], key=x, value=x,
             embed_dim_to_check=x.shape[-1],
@@ -100,6 +93,7 @@ class AttentionPool2d(nn.Module):
             training=self.training,
             need_weights=False
         )
+        print(x.size(), ' 4')
         return x.squeeze(0)
 
 
@@ -111,7 +105,7 @@ class ModifiedResNet(nn.Module):
     - The final pooling layer is a QKV attention instead of an average pool
     """
 
-    def __init__(self, layers, num_classes, heads, input_resolution=224, width=64):
+    def __init__(self, layers, num_classes, heads, classifier, input_resolution=224, width=64):
         super().__init__()
         self.num_classes = num_classes
         self.input_resolution = input_resolution
@@ -136,7 +130,8 @@ class ModifiedResNet(nn.Module):
         self.layer4 = self._make_layer(width * 8, layers[3], stride=2)
 
         embed_dim = width * 32  # the ResNet feature dimension
-        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, num_classes)
+        self.attnpool = AttentionPool2d(input_resolution // 32, embed_dim, heads, output_dim = num_classes)
+        self.classifier = classifier
 
     def _make_layer(self, planes, blocks, stride=1):
         layers = [Bottleneck(self._inplanes, planes, stride)]
@@ -148,13 +143,14 @@ class ModifiedResNet(nn.Module):
         return nn.Sequential(*layers)
 
     def forward(self, x):
+        B, T = x.size(0), x.size(2)
+        x = x.permute(0, 2, 1, 3, 4).flatten(0, 1) # Permute: (B,T,C,H,W), Flatten: (B*T, C, H, W)
         def stem(x):
             x = self.relu1(self.bn1(self.conv1(x)))
             x = self.relu2(self.bn2(self.conv2(x)))
             x = self.relu3(self.bn3(self.conv3(x)))
             x = self.avgpool(x)
             return x
-
         x = x.type(self.conv1.weight.dtype)
         x = stem(x)
         x = self.layer1(x)
@@ -162,7 +158,13 @@ class ModifiedResNet(nn.Module):
         x = self.layer3(x)
         x = self.layer4(x)
         x = self.attnpool(x)
-
+        x = x.view(B, T, x.size(1))
+        if self.classifier == 'mean':
+            x = x[:, :, :].mean(dim=1)
+        elif self.classifier == 'span2':
+            x = torch.stack((x[:, 0:T//2, :].mean(dim=1), x[:, T//2:, :].mean(dim=1))).view(B, x.size()[3] * 2)
+        elif self.classifier == 'difference':
+            x = x[:, 0:T//2, :].mean(dim=1) - x[:, T//2:, :].mean(dim=1)
         return x
 
 
@@ -214,9 +216,58 @@ class Transformer(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.resblocks(x)
 
+class expand_tubevit(nn.Module):
+    def __init__(self, scale, width):
+        super(expand_tubevit, self).__init__()
+        self.spatial_start_point = [45, 48, 87, 90]
+        self.patch_size = [3, 5, 7, 9]
+        self.class_embedding = nn.Parameter(scale * torch.randn(width))
 
+    def get_patch_index(self, x, spatial_point, patch_size):
+        if patch_size == 3:
+            sp = spatial_point
+        elif patch_size == 5:
+            sp = spatial_point - 15
+        elif patch_size == 7:
+            sp = spatial_point - (15 * 2)
+        elif patch_size == 9:
+            sp = spatial_point - (15 * 3)
+
+        patch_gap = (patch_size + 1) // 2
+        additional_pathes = [sp, sp+patch_gap, sp+(patch_gap*2),
+                                sp+(14 * patch_gap), sp+(14*patch_gap)+((patch_gap*2)),
+                                sp+(14 * patch_gap*2), sp+(14 * patch_gap*2)+patch_gap, sp+(14 * patch_gap*2)+(patch_gap*2)]
+        center_patch = [(14 * i) + sp + j + 1 for j in range(patch_size) for i in range(0, patch_size)] # j: 각 patch를 grid하게 탐색, i: 각 patch의 시작 point를 찾음
+        selected_patch = additional_pathes + center_patch
+        selected_patch.sort()
+        selected_patch = torch.index_select(x.cpu(), 0, torch.tensor(selected_patch)).cuda()
+        return selected_patch
+    
+    def forward(self, x):
+        expand_tube = torch.empty(0, x.size(1), x.size(2), x.size(3)).cuda()
+
+        for batch in range(x.size(0)):
+            tube = torch.empty(0, x.size(2), x.size(3)).cuda()
+            for frame_idx in range(x.size(1)):
+                # 현재 프레임 선택
+                distribute_frame = frame_idx % 4
+                if distribute_frame == 0:
+                    for spatial_point in self.spatial_start_point:
+                        st_tube = torch.empty(0,768).cuda()
+                        for i, idx in enumerate(range(frame_idx, frame_idx+4 , 1)):
+                            current_frame = x[batch, idx, :, :]
+                            selected_frame = self.get_patch_index(current_frame, spatial_point, self.patch_size[i])
+                            st_tube = torch.cat([st_tube, selected_frame], dim=0)
+                        st_tube = st_tube.unsqueeze(0)
+                        tube = torch.cat([tube, st_tube], dim=0)
+                else:
+                    pass
+            tube = tube.unsqueeze(0)
+            expand_tube = torch.cat([expand_tube, tube], dim=0)
+        return expand_tube
+    
 class VisionTransformer(nn.Module):
-    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, num_classes: int):
+    def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, num_classes: int, classifier: str, num_frames: int):
         super().__init__()
         self.input_resolution = input_resolution
         self.num_classes = num_classes
@@ -224,38 +275,79 @@ class VisionTransformer(nn.Module):
 
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
-        self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
+        self.spatial_positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2, width))
+        self.temporal_positional_embedding = nn.Parameter(scale * torch.randn(num_frames, width))
         self.ln_pre = LayerNorm(width)
 
         self.transformer = Transformer(width, layers, heads)
-
-        self.ln_post = LayerNorm(width)
         self.dropout = nn.Dropout(0.5)
-        self.fc = nn.Linear(width, num_classes)
-        nn.init.normal_(self.fc.weight, std=0.02)
-        nn.init.constant_(self.fc.bias, 0.)
+        self.classifier = classifier
+        if self.classifier == 'mean' or self.classifier == 'difference':
+            self.expand_fc = nn.Linear(width, num_classes)
+            self.ln_expand_post = LayerNorm(width)
+        elif self.classifier == 'span2':
+            self.expand_fc = nn.Linear(width * 2, num_classes)
+            self.ln_expand_post = LayerNorm(width * 2)
+        nn.init.normal_(self.expand_fc.weight, std=0.02)
+        nn.init.constant_(self.expand_fc.bias, 0.)
+        self.expand_tubevit = expand_tubevit(scale, width)
+
+    def _generate_position_embedding(self) -> torch.nn.Parameter:
+        position_embedding = [torch.zeros(1, self.hidden_dim)]
+
+        for i in range(len(self.kernel_sizes)):
+            tube_shape = self._calc_conv_shape(self.kernel_sizes[i], self.strides[i], self.offsets[i])
+            pos_embed = get_3d_sincos_pos_embed(
+                embed_dim=self.hidden_dim,
+                tube_shape=tube_shape,
+                kernel_size=self.kernel_sizes[i],
+                stride=self.strides[i],
+                offset=self.offsets[i],
+            )
+            position_embedding.append(pos_embed)
+
+        position_embedding = torch.cat(position_embedding, dim=0).contiguous()
+        return position_embedding
+    
 
     def forward(self, x: torch.Tensor):
+        B, T = x.size(0), x.size(2)
+        x = x.permute(0, 2, 1, 3, 4).flatten(0, 1) # Permute: (B,T,C,H,W), Flatten: (B*T, C, H, W)
         x = self.conv1(x)  # shape = [*, width, grid, grid]
+        spatial_size = tuple(x.size()[2:])
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+        
+        # Positional Embedding
+        x = x + self.spatial_positional_embedding.to(x.dtype)
+        S_patch, embedded_patch = x.shape[1], x.shape[2]
+        x = x.view(B, T, S_patch, embedded_patch)
+        x = x.permute(0, 2, 1, 3).flatten(0, 1) + self.temporal_positional_embedding
+        x = x.contiguous().view(B, T, S_patch, embedded_patch)
+
+        # Expand tube vit
+        x = self.expand_tubevit(x)
+        x = x.flatten(0, 1)
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
-        x = x + self.positional_embedding.to(x.dtype)
         x = self.ln_pre(x)
-
-        x = x.permute(1, 0, 2)  # NLD -> LND
         x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-
-        x = self.ln_post(x[:, 0, :])
+        x = x.contiguous().view(B, T, spatial_size[0] * spatial_size[1] + 1, x.size(-1))
+        
+        if self.classifier == 'mean':
+            x = x[:, :, 0, :].mean(dim=1)
+        elif self.classifier == 'span2':
+            x = torch.stack((x[:, 0:T//2, 0, :].mean(dim=1), x[:, T//2:, 0, :].mean(dim=1))).view(B, x.size()[3] * 2)
+        elif self.classifier == 'difference':
+            x = x[:, 0:T//2, 0, :].mean(dim=1) - x[:, T//2:, 0, :].mean(dim=1)
+        
+        x = self.ln_expand_post(x)
         x = self.dropout(x)
-        x = self.fc(x)
-
+        x = self.expand_fc(x)
         return x
     
-def build_model(model_name, download_root):
+def build_model(model_name, download_root, num_classes, classifier, num_frames):
     state_dict = load(model_name, download_root)
-    if 'vit' in model_name:
+    if 'ViT' in model_name:
         vision_width = state_dict["visual.conv1.weight"].shape[0]
         vision_layers = len([k for k in state_dict.keys() if k.startswith("visual.") and k.endswith(".attn.in_proj_weight")])
         vision_patch_size = state_dict["visual.conv1.weight"].shape[-1]
@@ -268,7 +360,9 @@ def build_model(model_name, download_root):
             width=vision_width,
             layers=vision_layers,
             heads=vision_heads,
-            num_classes=embed_dim
+            num_classes=num_classes,
+            classifier = classifier,
+            num_frames=num_frames
         )
     else:
         counts: list = [len(set(k.split(".")[2] for k in state_dict if k.startswith(f"visual.layer{b}"))) for b in [1, 2, 3, 4]]
@@ -285,8 +379,11 @@ def build_model(model_name, download_root):
                 num_classes=embed_dim,
                 heads=vision_heads,
                 input_resolution=image_resolution,
-                width=vision_width
+                width=vision_width,
+                classifier = classifier
         )
+    if 'ViT' in model_name:
+        model_name = model_name.replace('/' ,'-')
     checkpoint = torch.jit.load(f'{download_root}/{model_name}.pt', map_location='cpu')
     print(model.load_state_dict(checkpoint.visual.state_dict(), strict=False))
     return model

@@ -2,7 +2,10 @@ import torch
 from torchvision.io import read_video
 import torchvision
 import av
-
+import warnings
+from sklearn.preprocessing import LabelEncoder
+label_encoder = LabelEncoder()
+warnings.filterwarnings("ignore")
 def extract_frames(video_tensor, num_frames):
     total_frames = video_tensor.shape[0]
     
@@ -22,8 +25,8 @@ class VideoDataset(torch.utils.data.Dataset):
     def __init__(self, dataframe, num_frames, type, transform=None):
         self.transform = transform
         self.num_frames = num_frames
-        self.dataframe = dataframe[dataframe['type'] == type]
-        self.dataframe['index_label'] = self.dataframe['label'].astype('category').cat.codes
+        self.dataframe = dataframe[dataframe['type'] == type].reset_index(drop=True) 
+        self.dataframe['index_label'] = label_encoder.fit_transform(self.dataframe['label'])
     def __len__(self):
         return len(self.dataframe)
     def __getitem__(self, idx):

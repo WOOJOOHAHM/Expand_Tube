@@ -87,6 +87,5 @@ def load(model_name, download_root):
                 warnings.warn(f"File {model_path} is not a JIT archive. Loading as a state dict instead")
                 jit = False
             state_dict = torch.load(opened_file, map_location="cpu")
-
     return state_dict
 
